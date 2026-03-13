@@ -23,5 +23,12 @@ namespace REBUSS.Pure.Services.Common.Models
         public string Path { get; set; } = string.Empty;
         public string ChangeType { get; set; } = string.Empty;
         public string Diff { get; set; } = string.Empty;
+
+        /// <summary>
+        /// When set, indicates that diff generation was skipped and explains why
+        /// (e.g. "file deleted", "binary file", "generated file", "file renamed", "full file rewrite").
+        /// <c>null</c> means the diff was computed normally.
+        /// </summary>
+        public string? SkipReason { get; set; }
     }
 }

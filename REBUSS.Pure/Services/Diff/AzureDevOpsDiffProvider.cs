@@ -5,6 +5,7 @@ using REBUSS.Pure.AzureDevOpsIntegration.Services;
 using REBUSS.Pure.Services.Common;
 using REBUSS.Pure.Services.Common.Models;
 using REBUSS.Pure.Services.Common.Parsers;
+using REBUSS.Pure.Services.FileList.Classification;
 
 namespace REBUSS.Pure.Services.Diff
 {
@@ -18,11 +19,14 @@ namespace REBUSS.Pure.Services.Diff
     /// </summary>
     public class AzureDevOpsDiffProvider : IPullRequestDiffProvider
     {
+        private const int FullRewriteMinLineCount = 10;
+
         private readonly IAzureDevOpsApiClient _apiClient;
         private readonly IPullRequestMetadataParser _metadataParser;
         private readonly IIterationInfoParser _iterationParser;
         private readonly IFileChangesParser _changesParser;
         private readonly IUnifiedDiffBuilder _diffBuilder;
+        private readonly IFileClassifier _fileClassifier;
         private readonly ILogger<AzureDevOpsDiffProvider> _logger;
 
         public AzureDevOpsDiffProvider(
@@ -31,6 +35,7 @@ namespace REBUSS.Pure.Services.Diff
             IIterationInfoParser iterationParser,
             IFileChangesParser changesParser,
             IUnifiedDiffBuilder diffBuilder,
+            IFileClassifier fileClassifier,
             ILogger<AzureDevOpsDiffProvider> logger)
         {
             _apiClient = apiClient;
@@ -38,6 +43,7 @@ namespace REBUSS.Pure.Services.Diff
             _iterationParser = iterationParser;
             _changesParser = changesParser;
             _diffBuilder = diffBuilder;
+            _fileClassifier = fileClassifier;
             _logger = logger;
         }
 
@@ -166,11 +172,31 @@ namespace REBUSS.Pure.Services.Diff
                     continue;
                 }
 
+                var skipReason = GetSkipReason(file);
+                if (skipReason is not null)
+                {
+                    file.SkipReason = skipReason;
+                    file.Diff = BuildSkippedDiffMarker(file.Path, file.ChangeType, skipReason);
+                    _logger.LogDebug(
+                        "Skipping diff for '{FilePath}': {SkipReason}",
+                        file.Path, skipReason);
+                    continue;
+                }
+
                 var fileSw = Stopwatch.StartNew();
 
                 var baseContent   = await _apiClient.GetFileContentAtCommitAsync(baseCommit,   file.Path);
                 var targetContent = await _apiClient.GetFileContentAtCommitAsync(targetCommit, file.Path);
                 file.Diff = _diffBuilder.Build(file.Path, baseContent, targetContent);
+
+                if (IsFullFileRewrite(baseContent, targetContent, file.Diff))
+                {
+                    file.SkipReason = "full file rewrite";
+                    file.Diff = BuildSkippedDiffMarker(file.Path, file.ChangeType, "full file rewrite");
+                    _logger.LogDebug(
+                        "Replaced diff for '{FilePath}': detected full file rewrite",
+                        file.Path);
+                }
 
                 fileSw.Stop();
 
@@ -178,6 +204,76 @@ namespace REBUSS.Pure.Services.Diff
                     "Built diff for '{FilePath}' ({ChangeType}): {DiffLength} chars, {ElapsedMs}ms",
                     file.Path, file.ChangeType, file.Diff?.Length ?? 0, fileSw.ElapsedMilliseconds);
             }
+        }
+
+        /// <summary>
+        /// Returns a skip reason if the file should not have its diff computed,
+        /// or <c>null</c> if normal diff logic should proceed.
+        /// </summary>
+        internal string? GetSkipReason(FileChange file)
+        {
+            if (string.Equals(file.ChangeType, "delete", StringComparison.OrdinalIgnoreCase))
+                return "file deleted";
+
+            if (string.Equals(file.ChangeType, "rename", StringComparison.OrdinalIgnoreCase))
+                return "file renamed";
+
+            var classification = _fileClassifier.Classify(file.Path);
+
+            if (classification.IsBinary)
+                return "binary file";
+
+            if (classification.IsGenerated)
+                return "generated file";
+
+            return null;
+        }
+
+        /// <summary>
+        /// Detects a full-file rewrite: both contents are non-trivial but the diff
+        /// contains zero context (unchanged) lines, indicating every line changed.
+        /// </summary>
+        internal static bool IsFullFileRewrite(string? baseContent, string? targetContent, string diff)
+        {
+            if (string.IsNullOrEmpty(baseContent) || string.IsNullOrEmpty(targetContent))
+                return false;
+
+            if (string.IsNullOrEmpty(diff))
+                return false;
+
+            var oldLineCount = baseContent.Replace("\r\n", "\n").Split('\n').Length;
+            var newLineCount = targetContent.Replace("\r\n", "\n").Split('\n').Length;
+
+            if (oldLineCount < FullRewriteMinLineCount && newLineCount < FullRewriteMinLineCount)
+                return false;
+
+            var diffLines = diff.Split('\n');
+            bool inHunk = false;
+
+            foreach (var line in diffLines)
+            {
+                if (line.StartsWith("@@"))
+                {
+                    inHunk = true;
+                    continue;
+                }
+
+                if (inHunk && line.Length > 0 && line[0] == ' ')
+                    return false;
+            }
+
+            return inHunk;
+        }
+
+        private static string BuildSkippedDiffMarker(string path, string changeType, string reason)
+        {
+            var p = path.TrimStart('/');
+            var sb = new StringBuilder();
+            sb.AppendLine($"diff --git a/{p} b/{p}");
+            sb.AppendLine($"--- a/{p}");
+            sb.AppendLine($"+++ b/{p}");
+            sb.Append($"# {changeType} — {reason}, diff skipped");
+            return sb.ToString();
         }
 
         private static PullRequestDiff BuildDiff(

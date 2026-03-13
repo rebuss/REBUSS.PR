@@ -4,8 +4,10 @@ using NSubstitute;
 using NSubstitute.ExceptionExtensions;
 using REBUSS.Pure.AzureDevOpsIntegration.Services;
 using REBUSS.Pure.Services.Common;
+using REBUSS.Pure.Services.Common.Models;
 using REBUSS.Pure.Services.Common.Parsers;
 using REBUSS.Pure.Services.Diff;
+using REBUSS.Pure.Services.FileList.Classification;
 
 namespace REBUSS.Pure.Tests.Services;
 
@@ -55,6 +57,7 @@ public class AzureDevOpsDiffProviderTests
             new IterationInfoParser(NullLogger<IterationInfoParser>.Instance),
             new FileChangesParser(NullLogger<FileChangesParser>.Instance),
             new UnifiedDiffBuilder(new LcsDiffAlgorithm(), NullLogger<UnifiedDiffBuilder>.Instance),
+            new FileClassifier(),
             NullLogger<AzureDevOpsDiffProvider>.Instance);
     }
 
@@ -265,5 +268,373 @@ public class AzureDevOpsDiffProviderTests
         _apiClient.GetPullRequestDetailsAsync(42).Returns(PrDetailsJson);
         _apiClient.GetPullRequestIterationsAsync(42).Returns(IterationsJson);
         _apiClient.GetPullRequestIterationChangesAsync(42, 1).Returns(ChangesJson);
+    }
+
+    // --- Diff skip: Deletions ---
+
+    [Fact]
+    public async Task GetDiffAsync_SkipsDiff_ForDeletedFile()
+    {
+        _apiClient.GetPullRequestDetailsAsync(42).Returns(PrDetailsJson);
+        _apiClient.GetPullRequestIterationsAsync(42).Returns(IterationsJson);
+        _apiClient.GetPullRequestIterationChangesAsync(42, 1).Returns("""
+            {
+                "changeEntries": [
+                    { "changeType": "delete", "item": { "path": "/src/Removed.cs" } }
+                ]
+            }
+            """);
+
+        var result = await _provider.GetDiffAsync(42);
+
+        Assert.Single(result.Files);
+        Assert.Equal("file deleted", result.Files[0].SkipReason);
+        Assert.Contains("diff skipped", result.DiffContent);
+        await _apiClient.DidNotReceive().GetFileContentAtCommitAsync(Arg.Any<string>(), "/src/Removed.cs");
+    }
+
+    [Fact]
+    public async Task GetDiffAsync_SetsSkipReasonForDeletion()
+    {
+        _apiClient.GetPullRequestDetailsAsync(42).Returns(PrDetailsJson);
+        _apiClient.GetPullRequestIterationsAsync(42).Returns(IterationsJson);
+        _apiClient.GetPullRequestIterationChangesAsync(42, 1).Returns("""
+            {
+                "changeEntries": [
+                    { "changeType": "delete", "item": { "path": "/src/Old.cs" } }
+                ]
+            }
+            """);
+
+        var result = await _provider.GetDiffAsync(42);
+
+        Assert.Equal("file deleted", result.Files[0].SkipReason);
+        Assert.Contains("delete", result.Files[0].Diff);
+        Assert.Contains("file deleted", result.Files[0].Diff);
+    }
+
+    // --- Diff skip: Renames ---
+
+    [Fact]
+    public async Task GetDiffAsync_SkipsDiff_ForRenamedFile()
+    {
+        _apiClient.GetPullRequestDetailsAsync(42).Returns(PrDetailsJson);
+        _apiClient.GetPullRequestIterationsAsync(42).Returns(IterationsJson);
+        _apiClient.GetPullRequestIterationChangesAsync(42, 1).Returns("""
+            {
+                "changeEntries": [
+                    { "changeType": "rename", "item": { "path": "/src/NewName.cs" } }
+                ]
+            }
+            """);
+
+        var result = await _provider.GetDiffAsync(42);
+
+        Assert.Single(result.Files);
+        Assert.Equal("file renamed", result.Files[0].SkipReason);
+        Assert.Contains("diff skipped", result.DiffContent);
+        await _apiClient.DidNotReceive().GetFileContentAtCommitAsync(Arg.Any<string>(), "/src/NewName.cs");
+    }
+
+    [Fact]
+    public async Task GetDiffAsync_SetsSkipReasonForRename()
+    {
+        _apiClient.GetPullRequestDetailsAsync(42).Returns(PrDetailsJson);
+        _apiClient.GetPullRequestIterationsAsync(42).Returns(IterationsJson);
+        _apiClient.GetPullRequestIterationChangesAsync(42, 1).Returns("""
+            {
+                "changeEntries": [
+                    { "changeType": "rename", "item": { "path": "/src/Renamed.cs" } }
+                ]
+            }
+            """);
+
+        var result = await _provider.GetDiffAsync(42);
+
+        Assert.Equal("file renamed", result.Files[0].SkipReason);
+        Assert.Contains("rename", result.Files[0].Diff);
+        Assert.Contains("file renamed", result.Files[0].Diff);
+    }
+
+    // --- Diff skip: Binary files ---
+
+    [Fact]
+    public async Task GetDiffAsync_SkipsDiff_ForBinaryFile()
+    {
+        _apiClient.GetPullRequestDetailsAsync(42).Returns(PrDetailsJson);
+        _apiClient.GetPullRequestIterationsAsync(42).Returns(IterationsJson);
+        _apiClient.GetPullRequestIterationChangesAsync(42, 1).Returns("""
+            {
+                "changeEntries": [
+                    { "changeType": "edit", "item": { "path": "/assets/logo.png" } }
+                ]
+            }
+            """);
+
+        var result = await _provider.GetDiffAsync(42);
+
+        Assert.Single(result.Files);
+        Assert.Equal("binary file", result.Files[0].SkipReason);
+        Assert.Contains("diff skipped", result.DiffContent);
+        await _apiClient.DidNotReceive().GetFileContentAtCommitAsync(Arg.Any<string>(), "/assets/logo.png");
+    }
+
+    [Theory]
+    [InlineData("/lib/external.dll")]
+    [InlineData("/images/photo.jpg")]
+    [InlineData("/packages/archive.zip")]
+    [InlineData("/docs/manual.pdf")]
+    [InlineData("/assets/font.woff2")]
+    public async Task GetDiffAsync_SkipsDiff_ForVariousBinaryExtensions(string path)
+    {
+        _apiClient.GetPullRequestDetailsAsync(42).Returns(PrDetailsJson);
+        _apiClient.GetPullRequestIterationsAsync(42).Returns(IterationsJson);
+        _apiClient.GetPullRequestIterationChangesAsync(42, 1).Returns($$"""
+            {
+                "changeEntries": [
+                    { "changeType": "edit", "item": { "path": "{{path}}" } }
+                ]
+            }
+            """);
+
+        var result = await _provider.GetDiffAsync(42);
+
+        Assert.Equal("binary file", result.Files[0].SkipReason);
+    }
+
+    // --- Diff skip: Generated files ---
+
+    [Fact]
+    public async Task GetDiffAsync_SkipsDiff_ForGeneratedFile()
+    {
+        _apiClient.GetPullRequestDetailsAsync(42).Returns(PrDetailsJson);
+        _apiClient.GetPullRequestIterationsAsync(42).Returns(IterationsJson);
+        _apiClient.GetPullRequestIterationChangesAsync(42, 1).Returns("""
+            {
+                "changeEntries": [
+                    { "changeType": "edit", "item": { "path": "/obj/Debug/net8.0/AssemblyInfo.cs" } }
+                ]
+            }
+            """);
+
+        var result = await _provider.GetDiffAsync(42);
+
+        Assert.Single(result.Files);
+        Assert.Equal("generated file", result.Files[0].SkipReason);
+        Assert.Contains("diff skipped", result.DiffContent);
+        await _apiClient.DidNotReceive().GetFileContentAtCommitAsync(Arg.Any<string>(), "/obj/Debug/net8.0/AssemblyInfo.cs");
+    }
+
+    [Theory]
+    [InlineData("/obj/Debug/net8.0/AssemblyInfo.cs")]
+    [InlineData("/bin/Release/net8.0/app.dll")]
+    [InlineData("/src/Models/Client.g.cs")]
+    [InlineData("/src/Views/Main.designer.cs")]
+    public async Task GetDiffAsync_SkipsDiff_ForVariousGeneratedFiles(string path)
+    {
+        _apiClient.GetPullRequestDetailsAsync(42).Returns(PrDetailsJson);
+        _apiClient.GetPullRequestIterationsAsync(42).Returns(IterationsJson);
+        _apiClient.GetPullRequestIterationChangesAsync(42, 1).Returns($$"""
+            {
+                "changeEntries": [
+                    { "changeType": "edit", "item": { "path": "{{path}}" } }
+                ]
+            }
+            """);
+
+        var result = await _provider.GetDiffAsync(42);
+
+        Assert.NotNull(result.Files[0].SkipReason);
+        Assert.Contains("diff skipped", result.Files[0].Diff);
+    }
+
+    // --- Diff skip: Full-file rewrite ---
+
+    [Fact]
+    public async Task GetDiffAsync_SkipsDiff_ForFullFileRewrite()
+    {
+        _apiClient.GetPullRequestDetailsAsync(42).Returns(PrDetailsJson);
+        _apiClient.GetPullRequestIterationsAsync(42).Returns(IterationsJson);
+        _apiClient.GetPullRequestIterationChangesAsync(42, 1).Returns(ChangesJson);
+
+        // Generate content where every line is different and file is >= 10 lines
+        var oldContent = string.Join("\n", Enumerable.Range(1, 15).Select(i => $"old line {i}"));
+        var newContent = string.Join("\n", Enumerable.Range(1, 15).Select(i => $"new line {i}"));
+        _apiClient.GetFileContentAtCommitAsync("bbb222", "/src/File.cs").Returns(oldContent);
+        _apiClient.GetFileContentAtCommitAsync("aaa111", "/src/File.cs").Returns(newContent);
+
+        var result = await _provider.GetDiffAsync(42);
+
+        Assert.Equal("full file rewrite", result.Files[0].SkipReason);
+        Assert.Contains("diff skipped", result.Files[0].Diff);
+    }
+
+    [Fact]
+    public async Task GetDiffAsync_DoesNotSkip_ForPartialChange()
+    {
+        SetupStandardMocks();
+
+        // Change only one line in a multi-line file
+        var oldContent = "line1\nline2\nline3\nline4\nline5\nline6\nline7\nline8\nline9\nline10\nline11";
+        var newContent = "line1\nline2\nCHANGED\nline4\nline5\nline6\nline7\nline8\nline9\nline10\nline11";
+        _apiClient.GetFileContentAtCommitAsync("bbb222", "/src/File.cs").Returns(oldContent);
+        _apiClient.GetFileContentAtCommitAsync("aaa111", "/src/File.cs").Returns(newContent);
+
+        var result = await _provider.GetDiffAsync(42);
+
+        Assert.Null(result.Files[0].SkipReason);
+        Assert.Contains("-line3", result.DiffContent);
+        Assert.Contains("+CHANGED", result.DiffContent);
+    }
+
+    [Fact]
+    public async Task GetDiffAsync_DoesNotSkipFullRewrite_ForSmallFiles()
+    {
+        SetupStandardMocks();
+
+        // Small file (< 10 lines) with all lines different - should NOT be flagged
+        _apiClient.GetFileContentAtCommitAsync("bbb222", "/src/File.cs").Returns("old1\nold2\nold3");
+        _apiClient.GetFileContentAtCommitAsync("aaa111", "/src/File.cs").Returns("new1\nnew2\nnew3");
+
+        var result = await _provider.GetDiffAsync(42);
+
+        Assert.Null(result.Files[0].SkipReason);
+        Assert.Contains("-old1", result.DiffContent);
+        Assert.Contains("+new1", result.DiffContent);
+    }
+
+    // --- Mixed scenarios ---
+
+    [Fact]
+    public async Task GetDiffAsync_MixedFiles_OnlySkipsApplicable()
+    {
+        _apiClient.GetPullRequestDetailsAsync(42).Returns(PrDetailsJson);
+        _apiClient.GetPullRequestIterationsAsync(42).Returns(IterationsJson);
+        _apiClient.GetPullRequestIterationChangesAsync(42, 1).Returns("""
+            {
+                "changeEntries": [
+                    { "changeType": "edit",   "item": { "path": "/src/Service.cs" } },
+                    { "changeType": "delete", "item": { "path": "/src/Removed.cs" } },
+                    { "changeType": "edit",   "item": { "path": "/assets/icon.png" } }
+                ]
+            }
+            """);
+        _apiClient.GetFileContentAtCommitAsync("bbb222", "/src/Service.cs").Returns("old");
+        _apiClient.GetFileContentAtCommitAsync("aaa111", "/src/Service.cs").Returns("new");
+
+        var result = await _provider.GetDiffAsync(42);
+
+        Assert.Equal(3, result.Files.Count);
+        Assert.Null(result.Files[0].SkipReason);       // edit — computed normally
+        Assert.Equal("file deleted", result.Files[1].SkipReason);  // delete — skipped
+        Assert.Equal("binary file", result.Files[2].SkipReason);   // binary — skipped
+    }
+
+    [Fact]
+    public async Task GetDiffAsync_NormalEditFile_HasNullSkipReason()
+    {
+        SetupStandardMocks();
+        _apiClient.GetFileContentAtCommitAsync("bbb222", "/src/File.cs").Returns("old line");
+        _apiClient.GetFileContentAtCommitAsync("aaa111", "/src/File.cs").Returns("new line");
+
+        var result = await _provider.GetDiffAsync(42);
+
+        Assert.Null(result.Files[0].SkipReason);
+    }
+
+    // --- IsFullFileRewrite unit tests ---
+
+    [Fact]
+    public void IsFullFileRewrite_ReturnsFalse_WhenBaseContentIsNull()
+    {
+        Assert.False(AzureDevOpsDiffProvider.IsFullFileRewrite(null, "content", "diff"));
+    }
+
+    [Fact]
+    public void IsFullFileRewrite_ReturnsFalse_WhenTargetContentIsNull()
+    {
+        Assert.False(AzureDevOpsDiffProvider.IsFullFileRewrite("content", null, "diff"));
+    }
+
+    [Fact]
+    public void IsFullFileRewrite_ReturnsFalse_WhenDiffIsEmpty()
+    {
+        Assert.False(AzureDevOpsDiffProvider.IsFullFileRewrite("old", "new", string.Empty));
+    }
+
+    [Fact]
+    public void IsFullFileRewrite_ReturnsFalse_WhenFilesAreTooSmall()
+    {
+        var diff = "@@ -1,3 +1,3 @@\n-a\n-b\n-c\n+x\n+y\n+z";
+        Assert.False(AzureDevOpsDiffProvider.IsFullFileRewrite("a\nb\nc", "x\ny\nz", diff));
+    }
+
+    [Fact]
+    public void IsFullFileRewrite_ReturnsTrue_WhenNoContextLines()
+    {
+        var oldLines = string.Join("\n", Enumerable.Range(1, 12).Select(i => $"old{i}"));
+        var newLines = string.Join("\n", Enumerable.Range(1, 12).Select(i => $"new{i}"));
+        // A diff with no context lines (all - and + prefixed)
+        var diff = "@@ -1,12 +1,12 @@\n" +
+                   string.Join("\n", Enumerable.Range(1, 12).Select(i => $"-old{i}")) + "\n" +
+                   string.Join("\n", Enumerable.Range(1, 12).Select(i => $"+new{i}"));
+
+        Assert.True(AzureDevOpsDiffProvider.IsFullFileRewrite(oldLines, newLines, diff));
+    }
+
+    [Fact]
+    public void IsFullFileRewrite_ReturnsFalse_WhenContextLinesExist()
+    {
+        var oldLines = string.Join("\n", Enumerable.Range(1, 12).Select(i => $"line{i}"));
+        var newLines = "line1\nline2\nCHANGED\n" +
+                       string.Join("\n", Enumerable.Range(4, 9).Select(i => $"line{i}"));
+        // Diff has context lines (space-prefixed)
+        var diff = "@@ -1,12 +1,12 @@\n line1\n line2\n-line3\n+CHANGED\n line4";
+
+        Assert.False(AzureDevOpsDiffProvider.IsFullFileRewrite(oldLines, newLines, diff));
+    }
+
+    // --- GetSkipReason unit tests ---
+
+    [Fact]
+    public void GetSkipReason_ReturnsFileDeleted_ForDeleteChangeType()
+    {
+        var file = new FileChange { Path = "/src/File.cs", ChangeType = "delete" };
+        Assert.Equal("file deleted", _provider.GetSkipReason(file));
+    }
+
+    [Fact]
+    public void GetSkipReason_ReturnsFileRenamed_ForRenameChangeType()
+    {
+        var file = new FileChange { Path = "/src/File.cs", ChangeType = "rename" };
+        Assert.Equal("file renamed", _provider.GetSkipReason(file));
+    }
+
+    [Fact]
+    public void GetSkipReason_ReturnsBinaryFile_ForBinaryExtension()
+    {
+        var file = new FileChange { Path = "/assets/logo.png", ChangeType = "edit" };
+        Assert.Equal("binary file", _provider.GetSkipReason(file));
+    }
+
+    [Fact]
+    public void GetSkipReason_ReturnsGeneratedFile_ForGeneratedPath()
+    {
+        var file = new FileChange { Path = "/obj/Debug/net8.0/AssemblyInfo.cs", ChangeType = "edit" };
+        Assert.Equal("generated file", _provider.GetSkipReason(file));
+    }
+
+    [Fact]
+    public void GetSkipReason_ReturnsNull_ForNormalSourceFile()
+    {
+        var file = new FileChange { Path = "/src/Service.cs", ChangeType = "edit" };
+        Assert.Null(_provider.GetSkipReason(file));
+    }
+
+    [Fact]
+    public void GetSkipReason_ReturnsNull_ForNewFile()
+    {
+        var file = new FileChange { Path = "/src/NewService.cs", ChangeType = "add" };
+        Assert.Null(_provider.GetSkipReason(file));
     }
 }

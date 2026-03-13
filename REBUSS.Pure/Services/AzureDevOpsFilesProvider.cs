@@ -1,0 +1,116 @@
+using System.Diagnostics;
+using Microsoft.Extensions.Logging;
+using REBUSS.Pure.Services.Classification;
+using REBUSS.Pure.Services.Models;
+
+namespace REBUSS.Pure.Services
+{
+    /// <summary>
+    /// Fetches the list of changed files for a pull request, classifies each file,
+    /// computes per-file line stats from the diff content, and builds a category summary.
+    /// Delegates to <see cref="IPullRequestDiffProvider"/> for the raw file data and diffs.
+    /// </summary>
+    public class AzureDevOpsFilesProvider : IPullRequestFilesProvider
+    {
+        private readonly IPullRequestDiffProvider _diffProvider;
+        private readonly IFileClassifier _fileClassifier;
+        private readonly ILogger<AzureDevOpsFilesProvider> _logger;
+
+        public AzureDevOpsFilesProvider(
+            IPullRequestDiffProvider diffProvider,
+            IFileClassifier fileClassifier,
+            ILogger<AzureDevOpsFilesProvider> logger)
+        {
+            _diffProvider = diffProvider;
+            _fileClassifier = fileClassifier;
+            _logger = logger;
+        }
+
+        public async Task<PullRequestFiles> GetFilesAsync(int prNumber, CancellationToken cancellationToken = default)
+        {
+            _logger.LogInformation("Fetching files for PR #{PrNumber}", prNumber);
+            var sw = Stopwatch.StartNew();
+
+            var diff = await _diffProvider.GetDiffAsync(prNumber, cancellationToken);
+
+            var classified = diff.Files
+                .Select(f => (fileChange: f, classification: _fileClassifier.Classify(f.Path)))
+                .ToList();
+
+            var files = classified.Select(x => BuildFileInfo(x.fileChange, x.classification)).ToList();
+            var summary = BuildSummary(classified.Select(x => x.classification).ToList(), files);
+
+            sw.Stop();
+
+            _logger.LogInformation(
+                "Files for PR #{PrNumber} completed: {TotalFiles} file(s) " +
+                "(source={SourceFiles}, test={TestFiles}, config={ConfigFiles}, docs={DocsFiles}, " +
+                "binary={BinaryFiles}, generated={GeneratedFiles}, highPriority={HighPriority}), {ElapsedMs}ms",
+                prNumber, files.Count,
+                summary.SourceFiles, summary.TestFiles, summary.ConfigFiles, summary.DocsFiles,
+                summary.BinaryFiles, summary.GeneratedFiles, summary.HighPriorityFiles,
+                sw.ElapsedMilliseconds);
+
+            return new PullRequestFiles { Files = files, Summary = summary };
+        }
+
+        private static PullRequestFileInfo BuildFileInfo(FileChange fileChange, FileClassification classification)
+        {
+            var (additions, deletions) = CountDiffStats(fileChange.Diff);
+
+            return new PullRequestFileInfo
+            {
+                Path = fileChange.Path.TrimStart('/'),
+                Status = MapStatus(fileChange.ChangeType),
+                Additions = additions,
+                Deletions = deletions,
+                Changes = additions + deletions,
+                Extension = classification.Extension,
+                IsBinary = classification.IsBinary,
+                IsGenerated = classification.IsGenerated,
+                IsTestFile = classification.IsTestFile,
+                ReviewPriority = classification.ReviewPriority
+            };
+        }
+
+        private static string MapStatus(string changeType) => changeType.ToLowerInvariant() switch
+        {
+            "add" => "added",
+            "edit" => "modified",
+            "delete" => "removed",
+            "rename" => "renamed",
+            _ => changeType
+        };
+
+        public static (int additions, int deletions) CountDiffStats(string diff)
+        {
+            if (string.IsNullOrEmpty(diff))
+                return (0, 0);
+
+            int additions = 0, deletions = 0;
+            foreach (var line in diff.Split('\n'))
+            {
+                if (line.StartsWith('+') && !line.StartsWith("+++"))
+                    additions++;
+                else if (line.StartsWith('-') && !line.StartsWith("---"))
+                    deletions++;
+            }
+            return (additions, deletions);
+        }
+
+        private static PullRequestFilesSummary BuildSummary(
+            List<FileClassification> classifications, List<PullRequestFileInfo> files)
+        {
+            return new PullRequestFilesSummary
+            {
+                SourceFiles = classifications.Count(c => c.Category == FileCategory.Source),
+                TestFiles = classifications.Count(c => c.Category == FileCategory.Test),
+                ConfigFiles = classifications.Count(c => c.Category == FileCategory.Config),
+                DocsFiles = classifications.Count(c => c.Category == FileCategory.Docs),
+                BinaryFiles = classifications.Count(c => c.Category == FileCategory.Binary),
+                GeneratedFiles = classifications.Count(c => c.Category == FileCategory.Generated),
+                HighPriorityFiles = files.Count(f => f.ReviewPriority == "high")
+            };
+        }
+    }
+}

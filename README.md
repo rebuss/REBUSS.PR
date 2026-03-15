@@ -1,10 +1,11 @@
-# REBUSS.Pure – Pull Request Analysis MCP Server
+# REBUSS.Pure – Pull Request Analysis & Self-Review MCP Server
 
-REBUSS.Pure is a lightweight **MCP (Model Context Protocol) server** designed to enable intelligent pull request analysis by AI agents such as **GitHub Copilot**.
+REBUSS.Pure is a lightweight **MCP (Model Context Protocol) server** designed to enable intelligent code analysis by AI agents such as **GitHub Copilot**.
 
-The server provides structured access to pull request data from **Azure DevOps** while minimizing context usage and avoiding the need to clone repositories locally.
+The server provides structured access to code changes in two distinct modes:
 
-Its primary goal is to support **efficient AI-assisted code reviews** by exposing small, well-defined tools that allow agents to analyze pull requests incrementally.
+1. **PR review** — pull request data from **Azure DevOps**, fetched remotely without cloning
+2. **Self-review** — local git changes from the developer's own working tree, without any Azure DevOps connection
 
 ---
 
@@ -18,7 +19,25 @@ Modern AI coding assistants often struggle with large pull requests because:
 
 REBUSS.Pure solves this problem by exposing **small composable MCP tools** that allow an AI agent to retrieve only the information it needs.
 
-This enables scalable pull request analysis even for large repositories.
+This enables scalable pull request analysis even for large repositories, and also enables self-review of local changes **without any Azure DevOps setup at all**.
+
+---
+
+# Two Review Flows
+
+## PR Review
+
+Review changes from an Azure DevOps pull request. Requires Azure DevOps credentials.
+
+The agent calls `get_pr_metadata` → `get_pr_files` → `get_file_diff` / `get_pr_diff` → optionally `get_file_content_at_ref`.
+
+## Self-Review
+
+Review local git changes from your working tree, staged index, or a branch diff — **no Azure DevOps, no PAT, no network**.
+
+The agent calls `get_local_files` → `get_local_file_diff`.
+
+Works with any git repository on disk. The self-review tools use the same diff infrastructure and output shape as the PR tools, so AI agents follow the same incremental review pattern.
 
 ---
 
@@ -261,6 +280,58 @@ Full file retrieval is used **only when the diff alone is not sufficient** to un
 
 ---
 
+## get_local_files([scope])
+
+Lists all locally changed files in the git repository with classification metadata.
+
+Use this as the **first step of a self-review** to discover what changed before inspecting diffs.
+
+### Scope parameter
+
+| Value | Behavior |
+|---|---|
+| *(omitted)* or `working-tree` | All uncommitted changes vs HEAD (staged + unstaged) |
+| `staged` | Only staged (indexed) changes vs HEAD |
+| Any branch/ref name | All commits on the current branch not yet on the base (e.g. `main`, `origin/main`) |
+
+### Response fields
+
+Each file entry includes:
+
+- file path
+- change status (added, modified, removed, renamed)
+- file extension
+- binary, generated, and test file flags
+- review priority (`high` / `medium` / `low`)
+
+The response also includes:
+
+- `repositoryRoot` — the resolved git repository path
+- `scope` — the effective scope used
+- `currentBranch` — the checked-out branch name
+- `totalFiles` — the total number of changed files
+- an aggregated `summary` by file category (source, test, config, docs, binary, generated)
+
+> **Tip:** No Azure DevOps credentials are needed for this tool.
+
+---
+
+## get_local_file_diff(path, [scope])
+
+Returns a structured diff for a single locally changed file.
+
+Call `get_local_files` first to discover which files changed, then call this tool for files you want to inspect in detail.
+
+The `scope` parameter behaves identically to `get_local_files`.
+
+The response uses the same structure as `get_file_diff` (hunks with line-level `+`/`-`/` ` operations), so AI agents can apply the same review logic as for PR diffs.
+
+Files where a diff is not meaningful (deleted files, renamed files, full-file rewrites) are automatically skipped with a `skipReason` field — consistent with PR diff skip behavior.
+
+> **Tip:** No Azure DevOps credentials are needed for this tool.
+
+---
+
 # Diff Skip Behavior
 
 The diff provider **automatically skips** diff generation for files where a diff would be unnecessary, misleading, or wasteful.
@@ -306,7 +377,9 @@ Diff generation proceeds normally for:
 
 # AI-Driven Review Workflow
 
-The intended workflow for AI agents is:
+## PR Review workflow
+
+The intended workflow for AI agents reviewing an Azure DevOps pull request:
 
 1. Retrieve pull request metadata
 2. Retrieve the list of changed files
@@ -315,11 +388,22 @@ The intended workflow for AI agents is:
 5. Retrieve full file content only when necessary
 6. Produce a structured review report
 
-This incremental approach prevents context overload and allows AI tools to analyze large pull requests efficiently.
+## Self-Review workflow
+
+The intended workflow for AI agents reviewing local git changes:
+
+1. Call `get_local_files` with the desired scope to discover changed files
+2. Review the file list — note classification, review priority, and the summary
+3. Call `get_local_file_diff` for each file worth inspecting
+4. Produce a structured review report — no Azure DevOps access required
+
+Both workflows optimize for **incremental inspection**: start broad, then drill into details.
 
 ---
 
 # Example Workflow
+
+## PR Review
 
 ```
 get_pr_metadata(PR)
@@ -337,6 +421,20 @@ get_file_diff(PR, path)      ← per-file diff (all PR sizes)
 ↓ if more context required
 
 get_file_content_at_ref(path, head.sha)
+```
+
+## Self-Review
+
+```
+get_local_files()                   ← working-tree (default)
+get_local_files("staged")           ← staged changes only
+get_local_files("main")             ← current branch vs main
+
+↓ iterate files of interest
+
+get_local_file_diff(path)           ← working-tree diff
+get_local_file_diff(path, "staged") ← staged diff
+get_local_file_diff(path, "main")   ← branch diff
 ```
 
 ---

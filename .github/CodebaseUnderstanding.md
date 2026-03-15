@@ -57,6 +57,17 @@ Full codebase context is included below (file-role map, dependency graph, DI reg
 | `REBUSS.Pure\Services\Content\IFileContentProvider.cs` | Interface: file content at ref | `FileContent` |
 | `REBUSS.Pure\Services\Content\AzureDevOpsFileContentProvider.cs` | Fetches file content at specific Git ref | `IAzureDevOpsApiClient`, `FileContent` |
 
+### Local review pipeline
+
+| File | Role | Depends on |
+|---|---|---|
+| `REBUSS.Pure\Services\LocalReview\ILocalGitClient.cs` | Interface: local git operations; defines `LocalFileStatus` record | — |
+| `REBUSS.Pure\Services\LocalReview\LocalGitClient.cs` | Runs git child processes; exposes `WorkingTreeRef` sentinel for filesystem reads | `ILocalGitClient` |
+| `REBUSS.Pure\Services\LocalReview\LocalReviewScope.cs` | Value type: `WorkingTree`, `Staged`, `BranchDiff(base)` + `Parse(string?)` | — |
+| `REBUSS.Pure\Services\LocalReview\ILocalReviewProvider.cs` | Interface: lists local files + diffs; defines `LocalReviewFiles` model | `PullRequestDiff`, `PullRequestFileInfo`, `PullRequestFilesSummary` |
+| `REBUSS.Pure\Services\LocalReview\LocalReviewProvider.cs` | Orchestrates git client + diff builder + file classifier | `IWorkspaceRootProvider`, `ILocalGitClient`, `IStructuredDiffBuilder`, `IFileClassifier`, domain models |
+| `REBUSS.Pure\Services\LocalReview\LocalReviewExceptions.cs` | `LocalRepositoryNotFoundException`, `LocalFileNotFoundException` | — |
+
 ### Metadata pipeline
 
 | File | Role | Depends on |
@@ -92,15 +103,18 @@ Full codebase context is included below (file-role map, dependency graph, DI reg
 | `REBUSS.Pure\Tools\GetPullRequestMetadataToolHandler.cs` | `get_pr_metadata` — returns PR metadata JSON | `IPullRequestMetadataProvider`, `PullRequestMetadataResult` models |
 | `REBUSS.Pure\Tools\GetPullRequestFilesToolHandler.cs` | `get_pr_files` — returns classified file list JSON | `IPullRequestFilesProvider`, `PullRequestFilesResult` models |
 | `REBUSS.Pure\Tools\GetFileContentAtRefToolHandler.cs` | `get_file_content_at_ref` — returns file content JSON | `IFileContentProvider`, `FileContentAtRefResult` model |
+| `REBUSS.Pure\Tools\GetLocalChangesFilesToolHandler.cs` | `get_local_files` — lists locally changed files with classification | `ILocalReviewProvider`, `LocalReviewFilesResult` model |
+| `REBUSS.Pure\Tools\GetLocalFileDiffToolHandler.cs` | `get_local_file_diff` — returns structured diff for a single local file | `ILocalReviewProvider`, `StructuredDiffResult` models |
 
 ### Tool output models (JSON DTOs)
 
 | File | Role |
 |---|---|
-| `REBUSS.Pure\Tools\Models\StructuredDiffResult.cs` | `StructuredDiffResult`, `StructuredFileChange`, `StructuredHunk`, `StructuredLine` — diff tool JSON output |
+| `REBUSS.Pure\Tools\Models\StructuredDiffResult.cs` | `StructuredDiffResult`, `StructuredFileChange`, `StructuredHunk`, `StructuredLine` — diff tool JSON output (shared by PR and local tools) |
 | `REBUSS.Pure\Tools\Models\PullRequestMetadataResult.cs` | `PullRequestMetadataResult`, `AuthorInfo`, `RefInfo`, `PrStats`, `DescriptionInfo`, `SourceInfo` |
-| `REBUSS.Pure\Tools\Models\PullRequestFilesResult.cs` | `PullRequestFilesResult`, `PullRequestFileItem`, `PullRequestFilesSummaryResult` |
+| `REBUSS.Pure\Tools\Models\PullRequestFilesResult.cs` | `PullRequestFilesResult`, `PullRequestFileItem`, `PullRequestFilesSummaryResult` (also reused by `LocalReviewFilesResult`) |
 | `REBUSS.Pure\Tools\Models\FileContentAtRefResult.cs` | `FileContentAtRefResult` |
+| `REBUSS.Pure\Tools\Models\LocalReviewFilesResult.cs` | `LocalReviewFilesResult` — JSON output for `get_local_files`; includes `repositoryRoot`, `scope`, `currentBranch` context fields |
 
 ### MCP infrastructure (JSON-RPC server)
 
@@ -204,6 +218,11 @@ Full codebase context is included below (file-role map, dependency graph, DI reg
 | `REBUSS.Pure.Tests\Tools\GetFileDiffToolHandlerTests.cs` | `GetFileDiffToolHandler` — structured JSON output, validation, schema, exceptions |
 | `REBUSS.Pure.Tests\Tools\GetPullRequestFilesToolHandlerTests.cs` | `GetPullRequestFilesToolHandler` |
 | `REBUSS.Pure.Tests\Tools\GetFileContentAtRefToolHandlerTests.cs` | `GetFileContentAtRefToolHandler` |
+| `REBUSS.Pure.Tests\Tools\GetLocalChangesFilesToolHandlerTests.cs` | `GetLocalChangesFilesToolHandler` — scope parsing, JSON output, error handling |
+| `REBUSS.Pure.Tests\Tools\GetLocalFileDiffToolHandlerTests.cs` | `GetLocalFileDiffToolHandler` — validation, scope routing, error handling, tool definition |
+| `REBUSS.Pure.Tests\Services\LocalReview\LocalReviewScopeTests.cs` | `LocalReviewScope.Parse` — all scope kinds, ToString |
+| `REBUSS.Pure.Tests\Services\LocalReview\LocalGitClientParseTests.cs` | `LocalGitClient` porcelain/name-status parsing — via reflection on internal static methods |
+| `REBUSS.Pure.Tests\Services\LocalReview\LocalReviewProviderTests.cs` | `LocalReviewProvider` — files listing, status mapping, classification, file diff, skip reasons, exception cases |
 | `REBUSS.Pure.Tests\Integration\EndToEndTests.cs` | Full JSON-RPC pipeline: request → McpServer → handler → response |
 | `REBUSS.Pure.Tests\Mcp\McpServerTests.cs` | `McpServer` |
 | `REBUSS.Pure.Tests\Mcp\InitializeMethodHandlerTests.cs` | `InitializeMethodHandler` — roots extraction, storage, edge cases |
@@ -259,6 +278,20 @@ DiffEdit
 FileContent
   → AzureDevOpsFileContentProvider  (produces)
   → GetFileContentAtRefToolHandler  (consumes)
+
+LocalReviewScope / LocalFileStatus
+  → LocalGitClient                  (produces LocalFileStatus)
+  → LocalReviewProvider             (consumes: orchestrates git client + diff builder)
+  → GetLocalChangesFilesToolHandler (consumes scope string → parse → pass to provider)
+  → GetLocalFileDiffToolHandler     (consumes scope string + path → pass to provider)
+
+LocalReviewFiles
+  → LocalReviewProvider             (produces)
+  → GetLocalChangesFilesToolHandler (consumes: maps to LocalReviewFilesResult)
+
+PullRequestDiff (reused for local diffs)
+  → LocalReviewProvider             (produces for GetFileDiffAsync)
+  → GetLocalFileDiffToolHandler     (consumes: maps to StructuredDiffResult)
 
 PullRequestFiles / PullRequestFileInfo / PullRequestFilesSummary
   → AzureDevOpsFilesProvider        (produces)
@@ -363,10 +396,16 @@ services.AddSingleton<IFileContentProvider, AzureDevOpsFileContentProvider>();
 services.AddSingleton<IMcpToolHandler, GetPullRequestDiffToolHandler>();
 services.AddSingleton<IMcpToolHandler, GetFileDiffToolHandler>();
 services.AddSingleton<IMcpToolHandler, GetPullRequestMetadataToolHandler>();
-services.AddSingleton<IMcpToolHandler, GetPullRequestFilesToolHandler>();
-services.AddSingleton<IMcpToolHandler, GetFileContentAtRefToolHandler>();
+            services.AddSingleton<IMcpToolHandler, GetPullRequestFilesToolHandler>();
+            services.AddSingleton<IMcpToolHandler, GetFileContentAtRefToolHandler>();
 
-// JSON-RPC infrastructure
+            // Local self-review pipeline (no Azure DevOps required)
+            services.AddSingleton<ILocalGitClient, LocalGitClient>();
+            services.AddSingleton<ILocalReviewProvider, LocalReviewProvider>();
+            services.AddSingleton<IMcpToolHandler, GetLocalChangesFilesToolHandler>();
+            services.AddSingleton<IMcpToolHandler, GetLocalFileDiffToolHandler>();
+
+            // JSON-RPC infrastructure
 services.AddSingleton<IJsonRpcSerializer, SystemTextJsonSerializer>();
 services.AddSingleton<IJsonRpcTransport>(_ =>
     new StreamJsonRpcTransport(Console.OpenStandardInput(), Console.OpenStandardOutput()));

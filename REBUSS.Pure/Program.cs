@@ -14,6 +14,7 @@ using REBUSS.Pure.Services.Content;
 using REBUSS.Pure.Services.Diff;
 using REBUSS.Pure.Services.FileList;
 using REBUSS.Pure.Services.FileList.Classification;
+using REBUSS.Pure.Services.LocalReview;
 using REBUSS.Pure.Services.Metadata;
 using REBUSS.Pure.Tools;
 
@@ -180,6 +181,12 @@ namespace REBUSS.Pure
             services.AddSingleton<IMcpToolHandler, GetPullRequestMetadataToolHandler>();
             services.AddSingleton<IMcpToolHandler, GetPullRequestFilesToolHandler>();
             services.AddSingleton<IMcpToolHandler, GetFileContentAtRefToolHandler>();
+
+            // Local self-review pipeline
+            services.AddSingleton<ILocalGitClient, LocalGitClient>();
+            services.AddSingleton<ILocalReviewProvider, LocalReviewProvider>();
+            services.AddSingleton<IMcpToolHandler, GetLocalChangesFilesToolHandler>();
+            services.AddSingleton<IMcpToolHandler, GetLocalFileDiffToolHandler>();
 
             // JSON-RPC infrastructure
             services.AddSingleton<IJsonRpcSerializer, SystemTextJsonSerializer>();
